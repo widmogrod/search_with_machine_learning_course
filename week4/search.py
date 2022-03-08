@@ -10,6 +10,8 @@ from week4.opensearch import get_opensearch
 import week4.utilities.query_utils as qu
 import week4.utilities.ltr_utils as lu
 
+import json
+
 bp = Blueprint('search', __name__, url_prefix='/search')
 
 
@@ -56,9 +58,28 @@ def process_filters(filters_input):
 
     return filters, display_filters, applied_filters
 
-def get_query_category(user_query, query_class_model):
-    print("IMPLEMENT ME: get_query_category")
-    return None
+def get_query_categories(user_query, query_class_model, treshold=0.9):
+    if user_query is None or len(user_query) < 2:
+        return None
+    
+    # On production, input should be normalised in the same way as during training!
+    # Words with upper cases may return probabilities
+    (labels, scores) = query_class_model.predict(user_query, k=3)
+
+    print("")
+    print((labels, scores))
+    print("")
+
+    result = []
+    total = 0
+    for i, score in enumerate(scores):
+        category = labels[i].replace("__label__", "")
+        result.append((category, score))
+        total += score
+        if total > treshold:
+            break
+
+    return result
 
 
 @bp.route('/query', methods=['GET', 'POST'])
@@ -135,11 +156,28 @@ def query():
     else:
         query_obj = qu.create_query("*", "", [], sort, sortDir, size=100)
 
+    category_query = []
+    category_filter = []
     query_class_model = current_app.config["query_model"]
-    query_category = get_query_category(user_query, query_class_model)
-    if query_category is not None:
-        print("IMPLEMENT ME: add this into the filters object so that it gets applied at search time.  This should look like your `term` filter from week 1 for department but for categories instead")
-    #print("query obj: {}".format(query_obj))
+    query_categories = get_query_categories(user_query, query_class_model)
+    if len(query_categories) > 0:
+        for (category, score) in query_categories:
+            category_filter.append(category)
+            category_query.append('"{}"^{}'.format(category, score))
+
+        query_obj["query"]["bool"]["should"].append({
+            "query_string": {
+                "query": "categoryPathIds.keyword:({})".format(" OR ".join(category_query))
+            }
+        })
+        query_obj["query"]["bool"]["filter"].append({
+            "terms": {
+                "categoryPathIds.keyword": category_filter
+            }
+        })
+
+    print("query_categories = {}".format(query_categories))
+    print("query obj = {}".format(json.dumps(query_obj)))
     response = opensearch.search(body=query_obj, index=current_app.config["index_name"], explain=explain)
     # Postprocess results here if you so desire
 
@@ -147,7 +185,7 @@ def query():
     if error is None:
         return render_template("search_results.jinja2", query=user_query, search_response=response,
                                display_filters=display_filters, applied_filters=applied_filters,
-                               sort=sort, sortDir=sortDir, model=model, explain=explain, query_category=query_category)
+                               sort=sort, sortDir=sortDir, model=model, explain=explain, query_category=", ".join(category_filter))
     else:
         redirect(url_for("index"))
 
